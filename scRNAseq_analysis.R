@@ -1,0 +1,498 @@
+# BiocManager::install("monocle3")
+# install.packages("Seurat")
+library(Seurat)
+library(Matrix)
+
+# install.packages("BiocManager")
+# BiocManager::install("clusterProfiler")
+# BiocManager::install("org.Hs.eg.db")
+# BiocManager::install("SingleR")
+# BiocManager::install("celldex")
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+library(biomaRt)
+library(ggplot2)
+library(DESeq2)
+library(apeglm)
+library(dplyr)
+
+library(SingleR)
+library(celldex)
+
+setwd("~/Downloads/Elucidata_tasks/FSHD/")
+
+files <- list.files(pattern="GSM.*\\.txt$")
+
+# Function to read one file
+load_sample <- function(file) {
+       # remove txt extension
+       sample_name <- gsub(".txt","",file)
+       # read the file
+       mat <- read.table(file,
+                         header=TRUE,
+                         row.names=1,
+                         sep="\t",
+                         check.names=FALSE)
+       # convert to matrix
+       mat <- Matrix(as.matrix(mat), sparse=TRUE)
+       
+       # create seurat object
+       seu <- CreateSeuratObject(mat,
+                                 project=sample_name,
+                                 min.cells=3,
+                                 min.features=200)
+       # assign sample name
+       seu$sample_id <- sample_name
+       
+       return(seu)
+}
+
+
+
+mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+
+# Apply to all files
+seurat_list <- lapply(files, load_sample)
+
+# check the length of genenames before merging
+lapply(seurat_list, nrow)
+
+head(rownames(seurat_list[[1]]))
+
+# check length of common genes
+length(Reduce(intersect, lapply(seurat_list, rownames)))
+
+# the overlap of genes across all samples is good enough (~12k)
+
+# with varying number of genes in data from each sample, we can either take union 
+# of the genes (standard practice) or we can take intersection (common genes; more strict) 
+
+all_seu <- merge(seurat_list[[1]], y=seurat_list[-1])
+
+table(all_seu$sample_id)
+
+dim(all_seu)
+
+gene_map <- getBM(attributes=c("ensembl_gene_id","hgnc_symbol"),
+                  filters="ensembl_gene_id",
+                  values=rownames(all_seu),
+                  mart=mart)
+
+gene_symbols <- gene_map$hgnc_symbol
+names(gene_symbols) <- gene_map$ensembl_gene_id
+
+new_names <- gene_symbols[rownames(all_seu)]
+
+# print heads to check the naming
+head (gene_map)
+head(rownames(all_seu))
+head(gene_symbols)
+head(new_names)
+
+# replace missing HGNC symbols with original Ensembl ID
+new_names[is.na(new_names) | new_names == ""] <- 
+       rownames(all_seu)[is.na(new_names) | new_names == ""]
+
+# make the names unique (to avoid issues with duplicate rownames)
+new_names <- make.unique(new_names)
+
+# replace ensembl IDs with HGNC symbols
+rownames(all_seu) <- new_names
+
+head(rownames(all_seu))
+
+# check if any of the IDs contain version numbers
+any(grepl("\\.", rownames(all_seu)))
+
+# if yes, do this
+# rownames(all_seu) <- sub("\\..*", "", rownames(all_seu))
+
+# check clustering in the data
+all_seu <- NormalizeData(all_seu)
+all_seu <- FindVariableFeatures(all_seu, selection.method="vst", nfeatures=2000)
+all_seu <- ScaleData(all_seu)
+all_seu <- RunPCA(all_seu)
+
+DimPlot(all_seu, group.by="sample_id")
+
+all_seu <- RunUMAP(all_seu, dims=1:20)
+DimPlot(all_seu, reduction = "umap")
+
+all_seu[["percent.mt"]] <- PercentageFeatureSet(all_seu, pattern="^MT-")
+
+VlnPlot(all_seu, features=c("nFeature_RNA","nCount_RNA","percent.mt"), group.by="sample_id")
+
+# Filtering of data
+# subset the data with thresholds defined on the basis of visual inspection
+all_seu <- subset(all_seu, subset = nFeature_RNA >500 & nFeature_RNA < 5000 & percent.mt < 15)
+
+# check again the clustering pattern
+all_seu <- NormalizeData(all_seu)
+all_seu <- FindVariableFeatures(all_seu, selection.method="vst", nfeatures=2000)
+all_seu <- ScaleData(all_seu)
+all_seu <- RunPCA(all_seu)
+
+
+VizDimLoadings(all_seu, dims = 1:2, reduction = "pca")
+# DimPlot(all_seu, reduction = "pca") + NoLegend()
+
+
+DimHeatmap(all_seu, dims = 1:9, cells = 500, balanced = TRUE)
+# ElbowPlot(all_seu)
+
+# print weights of genes for PCs
+# Loadings(all_seu[["pca"]])[,1]
+
+all_seu <- RunUMAP(all_seu, dims=1:20)
+DimPlot(all_seu, reduction = "umap")
+
+
+
+# now, there were isolated groups in the umap plot prior filtering
+# and we visualize that they are still there
+# so it is most likely not because of High mitochondrial cells, Empty droplets, or Extreme low-quality cells
+# 
+# Now, is it technical or biological?
+all_seu <- FindNeighbors(all_seu, dims = 1:20)
+all_seu <- FindClusters(all_seu, resolution = 0.5)
+
+# look at cluster IDs
+head(Idents(all_seu), 5)
+
+
+all_seu <- RunUMAP(all_seu, dims=1:20)
+
+DimPlot(all_seu, reduction = "umap")
+DimPlot(all_seu, group.by="sample_id")
+
+
+
+
+
+
+all_seu <- JoinLayers(all_seu)
+
+# Finding differentially expressed features (cluster biomarkers)
+cluster0.markers <- FindMarkers(all_seu, ident.1 = 0)
+head(cluster0.markers, n = 5)
+
+cluster6.markers <- FindMarkers(all_seu, ident.1 = 6)
+head(cluster6.markers, n = 5)
+
+# find markers for every cluster compared to all remaining cells, report only the positive
+# ones
+all_seu.markers <- FindAllMarkers(all_seu, only.pos = TRUE)
+all_seu.markers %>%
+       group_by(cluster) %>%
+       dplyr::filter(avg_log2FC > 1, pct.1 > 0.7, pct.2 < 0.3)
+
+# assign conditions
+all_seu$type <- ifelse(grepl("CTRL", all_seu$sample_id),
+                            "CTRL", ifelse(grepl("FSHD1", all_seu$sample_id),
+                                           "FSHD1", "FSHD2"))
+all_seu$condition <- ifelse(grepl("CTRL", all_seu$sample_id),
+                            "CTRL",
+                            "FSHD")
+
+Idents(all_seu) <- "condition"
+
+fshd_ctrl <- FindMarkers(all_seu,
+                         group.by="condition",
+                         ident.1="FSHD",
+                         ident.2="CTRL")
+fshd_ctrl <- fshd_ctrl[order(fshd_ctrl$avg_log2FC, decreasing=TRUE), ]
+head(fshd_ctrl, 20)
+
+
+
+
+# now, load DUX4-67 gene set that the author have used 
+dux4_genes <- read.table("DUX_gene_set", header = F)
+
+dux4_present <- intersect(dux4_genes[,1], rownames(all_seu))
+expr_mat <- GetAssayData(all_seu, layer="counts")[dux4_present, ]
+
+all_seu$DUX4_gene_count <- colSums(expr_mat > 0)
+all_seu$DUX4_cum_reads  <- colSums(expr_mat)
+
+all_seu$DUX4_affected <- all_seu$DUX4_gene_count >= 5
+
+
+ggplot(all_seu@meta.data,
+       aes(x = DUX4_gene_count,
+           y = DUX4_cum_reads,
+           color = sample_id)) +
+       geom_point(alpha = 0.9, size=5) +
+       geom_vline(xintercept = 5, linetype = "dashed") +
+       theme_classic()
+
+# UMAP colored by DUX4 count
+FeaturePlot(all_seu,
+            features = "DUX4_gene_count",
+            cols = c("grey90", "red"))
+
+# Count DUX4 Cells Per Sample 
+table(all_seu$sample_id,
+      all_seu$DUX4_affected)
+
+# proportion per sample
+prop.table(table(all_seu$sample_id,
+                 all_seu$DUX4_affected), 1)[,2]
+
+# cluster enrichment
+table(all_seu$seurat_clusters,
+      all_seu$DUX4_affected)
+
+
+# Pathway Enrichment of DUX4-Positive Cells
+
+# subset only FSHD cells
+fshd_only <- subset(all_seu, subset = condition == "FSHD")
+
+# set identity
+Idents(fshd_only) <- "DUX4_affected"
+
+# differential expression
+dux4_vs_rest <- FindMarkers(fshd_only,
+                            ident.1 = TRUE,
+                            ident.2 = FALSE,
+                            min.pct = 0.1,
+                            logfc.threshold = 0.25)
+
+
+# Pseudobulk analysis
+counts <- as.matrix(GetAssayData(all_seu, layer = "counts"))
+
+# sample level aggregation
+
+
+sample_ids <- all_seu$sample_id
+
+# make sure sample_ids are aligned
+sample_ids <- all_seu$sample_id
+names(sample_ids) <- colnames(counts)
+
+# aggregate
+pseudobulk_counts <- do.call(cbind,
+                             lapply(unique(sample_ids), function(s) {
+                                    Matrix::rowSums(counts[, sample_ids == s])
+                             })
+)
+
+colnames(pseudobulk_counts) <- unique(sample_ids)
+
+dim(pseudobulk_counts)
+
+
+
+sample_metadata <- data.frame(
+       row.names = colnames(pseudobulk_counts),
+       condition = ifelse(grepl("CTRL", colnames(pseudobulk_counts)),
+                          "CTRL", "FSHD")
+)
+
+dds <- DESeqDataSetFromMatrix(
+       countData = pseudobulk_counts,
+       colData = sample_metadata,
+       design = ~ condition
+)
+
+dds <- DESeq(dds)
+res <- results(dds)
+
+colSums(pseudobulk_counts)
+
+
+# Right now you are using raw MLE log2FC.
+# 
+# With small sample size, we should shrink them.
+# 
+# This makes volcano plots much more stable and paper-like.
+
+res_shrunk <- lfcShrink(dds,
+                        coef = "condition_FSHD_vs_CTRL",
+                        type = "apeglm")
+res_df <- as.data.frame(res_shrunk)
+res_df$gene <- rownames(res_df)
+
+# remove NA padj
+res_df <- res_df[!is.na(res_df$padj), ]
+
+# compute -log10
+res_df$neg_log10_p <- -log10(res_df$padj)
+
+# define significance
+res_df$significance <- "NS"
+res_df$significance[res_df$log2FoldChange > 1 & res_df$padj < 0.05] <- "Up"
+res_df$significance[res_df$log2FoldChange < -1 & res_df$padj < 0.05] <- "Down"
+
+# number of up- and down-reg genes
+table(res_df$significance)
+
+
+# Make a volcano plot
+ggplot(res_df,
+       aes(x = log2FoldChange,
+           y = neg_log10_p,
+           color = significance)) +
+       geom_point(alpha = 0.7, size = 2) +
+       scale_color_manual(values = c("Up"="red",
+                                     "Down"="blue",
+                                     "NS"="grey70")) +
+       geom_vline(xintercept = c(-1,1), linetype="dashed") +
+       geom_hline(yintercept = -log10(0.05), linetype="dashed") +
+       theme_classic() +
+       labs(title="FSHD vs CTRL (Pseudobulk DESeq2)",
+            x="Log2 Fold Change",
+            y="-log10(adj p-value)")
+
+
+
+# DUX4+ vs DUX4 - cell based pseudobulk analysis DEGs
+fshd_only <- subset(all_seu, subset = condition == "FSHD")
+
+counts <- GetAssayData(fshd_only, layer = "counts")
+counts <- as(counts, "dgCMatrix")
+group_id <- paste(fshd_only$sample_id,
+                  fshd_only$DUX4_affected,
+                  sep = "_")
+
+names(group_id) <- colnames(counts)
+
+pseudobulk_counts <- do.call(cbind,
+                             lapply(unique(group_id), function(g) {
+                                    Matrix::rowSums(counts[, group_id == g])
+                             })
+)
+
+colnames(pseudobulk_counts) <- unique(group_id)
+
+dim(pseudobulk_counts)
+
+# create metadata
+sample_info <- data.frame(
+       row.names = colnames(pseudobulk_counts)
+)
+
+sample_info$sample <- sub("_(TRUE|FALSE)$", "", rownames(sample_info))
+sample_info$DUX4_status <- ifelse(grepl("TRUE$", rownames(sample_info)),
+                                  "DUX4pos",
+                                  "DUX4neg")
+
+
+dds <- DESeqDataSetFromMatrix(
+       countData = pseudobulk_counts,
+       colData = sample_info,
+       design = ~ sample + DUX4_status
+)
+
+dds <- DESeq(dds)
+
+res <- results(dds, contrast = c("DUX4_status", "DUX4pos", "DUX4neg"))
+
+res_shrunk <- lfcShrink(dds,
+                        coef = "DUX4_status_DUX4pos_vs_DUX4neg",
+                        type = "apeglm")
+
+
+res_df <- as.data.frame(res_shrunk)
+res_df$gene <- rownames(res_df)
+res_df <- res_df[!is.na(res_df$padj), ]
+res_df$neg_log10_p <- -log10(res_df$padj)
+
+res_df$significance <- "NS"
+res_df$significance[res_df$log2FoldChange > 1 & res_df$padj < 0.05] <- "Up"
+res_df$significance[res_df$log2FoldChange < -1 & res_df$padj < 0.05] <- "Down"
+
+ggplot(res_df,
+       aes(x = log2FoldChange,
+           y = neg_log10_p,
+           color = significance)) +
+       geom_point(alpha = 0.7, size = 2) +
+       scale_color_manual(values = c("Up"="red",
+                                     "Down"="blue",
+                                     "NS"="grey70")) +
+       geom_vline(xintercept = c(-1,1), linetype="dashed") +
+       geom_hline(yintercept = -log10(0.05), linetype="dashed") +
+       theme_classic() +
+       labs(title="DUX4+ vs DUX4− (Pseudobulk)",
+            x="Log2 Fold Change",
+            y="-log10(adj p-value)")
+
+# remove NA
+res_df_clean <- res_df[!is.na(res_df$padj), ]
+
+# create ranked vector
+gene_list <- res_df_clean$log2FoldChange
+names(gene_list) <- res_df_clean$gene
+
+# define thresholds
+up_genes <- res_df_clean$gene[
+       res_df_clean$padj < 0.05 & res_df_clean$log2FoldChange > 1
+]
+
+down_genes <- res_df_clean$gene[
+       res_df_clean$padj < 0.05 & res_df_clean$log2FoldChange < -1
+]
+
+length(up_genes)
+length(down_genes)
+
+# UP genes
+up_entrez <- bitr(up_genes,
+                  fromType = "SYMBOL",
+                  toType = "ENTREZID",
+                  OrgDb = org.Hs.eg.db)
+
+# DOWN genes
+down_entrez <- bitr(down_genes,
+                    fromType = "SYMBOL",
+                    toType = "ENTREZID",
+                    OrgDb = org.Hs.eg.db)
+
+kegg_up <- enrichKEGG(
+       gene = up_entrez$ENTREZID,
+       organism = "hsa",
+       pAdjustMethod = "BH"
+)
+
+head(kegg_up)
+
+kegg_down <- enrichKEGG(
+       gene = down_entrez$ENTREZID,
+       organism = "hsa",
+       pAdjustMethod = "BH"
+)
+
+head(kegg_down)
+
+p_up <- dotplot(kegg_up, showCategory = 15) +
+       ggtitle("KEGG Pathways – Upregulated")
+
+p_down <- dotplot(kegg_down, showCategory = 15) +
+       ggtitle("KEGG Pathways – Downregulated")
+
+p_up+p_down
+
+
+# Cell type annotation
+ref <- HumanPrimaryCellAtlasData()
+
+pred <- SingleR(
+       test = GetAssayData(all_seu, layer="data"),
+       ref = ref,
+       labels = ref$label.main
+)
+
+all_seu$SingleR_labels <- pred$labels
+
+DimPlot(all_seu, group.by="SingleR_labels", label=TRUE)
+
+
+
+
+
+
+
